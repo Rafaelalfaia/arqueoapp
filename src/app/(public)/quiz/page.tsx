@@ -17,10 +17,15 @@ export default function QuizHome() {
           </div>
         </Link>
 
-        <div className="border rounded p-4 opacity-50">
+        <Link
+          className="border rounded p-4 hover:opacity-90"
+          href="/quiz/amizade"
+        >
           <div className="font-medium">Amizade</div>
-          <div className="text-sm">Em breve</div>
-        </div>
+          <div className="text-sm opacity-80">
+            Sala por código/link • lobby em tempo real • 2–8 jogadores.
+          </div>
+        </Link>
 
         <div className="border rounded p-4 opacity-50">
           <div className="font-medium">Torneio</div>

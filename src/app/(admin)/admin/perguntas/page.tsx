@@ -13,9 +13,13 @@ import {
   query,
   serverTimestamp,
   where,
+  doc,
+  updateDoc,
+  deleteDoc,
   type DocumentData,
   type QueryDocumentSnapshot,
 } from "firebase/firestore";
+
 import { db } from "@/lib/firebase/client";
 import { useAuth } from "@/lib/auth/AuthProvider";
 
@@ -196,6 +200,17 @@ export default function AdminPerguntasPage() {
   const [diff, setDiff] = useState<Difficulty>("easy");
   const [active, setActive] = useState(true);
 
+  // edit
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [eText, setEText] = useState("");
+  const [e0, setE0] = useState("");
+  const [e1, setE1] = useState("");
+  const [e2, setE2] = useState("");
+  const [e3, setE3] = useState("");
+  const [eCorrectIndex, setECorrectIndex] = useState(0);
+  const [eDiff, setEDiff] = useState<Difficulty>("easy");
+  const [eActive, setEActive] = useState(true);
+
   // import
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importBusy, setImportBusy] = useState(false);
@@ -276,6 +291,104 @@ export default function AdminPerguntasPage() {
       setDiff("easy");
       setActive(true);
 
+      await load();
+    } catch (e: unknown) {
+      setErr(getErrMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  function pad4(arr: string[]) {
+    return [arr[0] ?? "", arr[1] ?? "", arr[2] ?? "", arr[3] ?? ""];
+  }
+
+  function startEdit(q: Question) {
+    const [p0, p1, p2, p3] = pad4(q.choices);
+    setEditingId(q.id);
+    setEText(q.text);
+    setE0(p0);
+    setE1(p1);
+    setE2(p2);
+    setE3(p3);
+    setECorrectIndex(q.correctIndex ?? 0);
+    setEDiff(q.difficulty ?? "easy");
+    setEActive(q.active ?? true);
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEText("");
+    setE0("");
+    setE1("");
+    setE2("");
+    setE3("");
+    setECorrectIndex(0);
+    setEDiff("easy");
+    setEActive(true);
+  }
+
+  async function saveEdit(id: string) {
+    setBusy(true);
+    setErr(null);
+
+    try {
+      const t = eText.trim();
+      const choices = [e0, e1, e2, e3].map((v) => v.trim());
+
+      if (!t) throw new Error("Texto é obrigatório");
+      if (choices.some((v) => !v))
+        throw new Error("Preencha as 4 alternativas");
+      if (eCorrectIndex < 0 || eCorrectIndex > 3)
+        throw new Error("Correta inválida (0–3)");
+
+      const ref = doc(db, "quiz_questions", id);
+      await updateDoc(ref, {
+        text: t,
+        choices,
+        correctIndex: eCorrectIndex,
+        difficulty: eDiff,
+        active: eActive,
+        updatedAt: serverTimestamp(),
+      });
+
+      cancelEdit();
+      await load();
+    } catch (e: unknown) {
+      setErr(getErrMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleActive(id: string, next: boolean) {
+    setBusy(true);
+    setErr(null);
+
+    try {
+      const ref = doc(db, "quiz_questions", id);
+      await updateDoc(ref, { active: next, updatedAt: serverTimestamp() });
+      await load();
+    } catch (e: unknown) {
+      setErr(getErrMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteOne(id: string) {
+    const ok = confirm(
+      "Tem certeza que deseja excluir esta pergunta? Essa ação não pode ser desfeita."
+    );
+    if (!ok) return;
+
+    setBusy(true);
+    setErr(null);
+
+    try {
+      const ref = doc(db, "quiz_questions", id);
+      await deleteDoc(ref);
+
+      if (editingId === id) cancelEdit();
       await load();
     } catch (e: unknown) {
       setErr(getErrMsg(e));
@@ -551,25 +664,163 @@ export default function AdminPerguntasPage() {
           <h2 className="font-medium">Perguntas ({items.length})</h2>
 
           <div className="mt-3 space-y-3 max-h-[70vh] overflow-auto pr-2">
-            {items.map((q) => (
-              <div key={q.id} className="border rounded p-3">
-                <div className="text-xs opacity-70">
-                  {q.difficulty.toUpperCase()} •{" "}
-                  {q.active ? "ATIVA" : "INATIVA"}
+            {items.map((q) => {
+              const isEditing = editingId === q.id;
+
+              return (
+                <div key={q.id} className="border rounded p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="text-xs opacity-70">
+                      {q.difficulty.toUpperCase()} •{" "}
+                      {q.active ? "ATIVA" : "INATIVA"}
+                    </div>
+
+                    <div className="flex gap-2 flex-wrap">
+                      {!isEditing ? (
+                        <>
+                          <button
+                            className="border rounded px-3 py-1 text-sm"
+                            onClick={() => startEdit(q)}
+                            disabled={uiBusy}
+                          >
+                            Editar
+                          </button>
+
+                          <button
+                            className="border rounded px-3 py-1 text-sm"
+                            onClick={() => toggleActive(q.id, !q.active)}
+                            disabled={uiBusy}
+                            title="Ativa/Desativa sem excluir"
+                          >
+                            {q.active ? "Desativar" : "Ativar"}
+                          </button>
+
+                          <button
+                            className="border rounded px-3 py-1 text-sm text-red-600 border-red-300"
+                            onClick={() => deleteOne(q.id)}
+                            disabled={uiBusy}
+                          >
+                            Excluir
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            className="border rounded px-3 py-1 text-sm"
+                            onClick={() => saveEdit(q.id)}
+                            disabled={uiBusy}
+                          >
+                            Salvar
+                          </button>
+
+                          <button
+                            className="border rounded px-3 py-1 text-sm"
+                            onClick={cancelEdit}
+                            disabled={uiBusy}
+                          >
+                            Cancelar
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {!isEditing ? (
+                    <>
+                      <div className="mt-1 font-medium">{q.text}</div>
+                      <ol className="mt-2 text-sm list-decimal pl-5 space-y-1">
+                        {q.choices.map((c, i) => (
+                          <li
+                            key={i}
+                            className={i === q.correctIndex ? "underline" : ""}
+                          >
+                            {c}
+                          </li>
+                        ))}
+                      </ol>
+                    </>
+                  ) : (
+                    <div className="mt-3 space-y-2">
+                      <input
+                        className="w-full border rounded px-3 py-2"
+                        value={eText}
+                        onChange={(e) => setEText(e.target.value)}
+                        disabled={uiBusy}
+                        placeholder="Texto da pergunta"
+                      />
+
+                      <input
+                        className="w-full border rounded px-3 py-2"
+                        value={e0}
+                        onChange={(e) => setE0(e.target.value)}
+                        disabled={uiBusy}
+                        placeholder="Alternativa 1"
+                      />
+                      <input
+                        className="w-full border rounded px-3 py-2"
+                        value={e1}
+                        onChange={(e) => setE1(e.target.value)}
+                        disabled={uiBusy}
+                        placeholder="Alternativa 2"
+                      />
+                      <input
+                        className="w-full border rounded px-3 py-2"
+                        value={e2}
+                        onChange={(e) => setE2(e.target.value)}
+                        disabled={uiBusy}
+                        placeholder="Alternativa 3"
+                      />
+                      <input
+                        className="w-full border rounded px-3 py-2"
+                        value={e3}
+                        onChange={(e) => setE3(e.target.value)}
+                        disabled={uiBusy}
+                        placeholder="Alternativa 4"
+                      />
+
+                      <div className="flex gap-3 flex-wrap">
+                        <select
+                          className="border rounded px-3 py-2"
+                          value={eCorrectIndex}
+                          onChange={(e) =>
+                            setECorrectIndex(Number(e.target.value))
+                          }
+                          disabled={uiBusy}
+                        >
+                          <option value={0}>Correta: 1</option>
+                          <option value={1}>Correta: 2</option>
+                          <option value={2}>Correta: 3</option>
+                          <option value={3}>Correta: 4</option>
+                        </select>
+
+                        <select
+                          className="border rounded px-3 py-2"
+                          value={eDiff}
+                          onChange={(e) =>
+                            setEDiff(asDifficulty(e.target.value))
+                          }
+                          disabled={uiBusy}
+                        >
+                          <option value="easy">Fácil</option>
+                          <option value="medium">Média</option>
+                          <option value="hard">Difícil</option>
+                        </select>
+
+                        <label className="flex items-center gap-2 text-sm">
+                          <input
+                            type="checkbox"
+                            checked={eActive}
+                            onChange={(e) => setEActive(e.target.checked)}
+                            disabled={uiBusy}
+                          />
+                          Ativa
+                        </label>
+                      </div>
+                    </div>
+                  )}
                 </div>
-                <div className="mt-1 font-medium">{q.text}</div>
-                <ol className="mt-2 text-sm list-decimal pl-5 space-y-1">
-                  {q.choices.map((c, i) => (
-                    <li
-                      key={i}
-                      className={i === q.correctIndex ? "underline" : ""}
-                    >
-                      {c}
-                    </li>
-                  ))}
-                </ol>
-              </div>
-            ))}
+              );
+            })}
 
             {items.length === 0 && (
               <p className="text-sm opacity-70">Nenhuma pergunta.</p>

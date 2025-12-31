@@ -1,3 +1,5 @@
+// C:\Users\rafae\arqueoapp\src\app\(public)\quiz\classico\page.tsx
+
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -28,7 +30,7 @@ type SubmitOk = {
 };
 
 function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 function isDifficulty(v: unknown): v is Difficulty {
@@ -99,6 +101,7 @@ function parseApiError(data: unknown, fallback: string): string {
 
   // Mensagens refinadas por código
   if (code === "unauthorized") return "Sessão inválida. Faça login novamente.";
+
   if (code === "not_enough_questions") {
     const available =
       typeof data.available === "number" ? data.available : null;
@@ -107,7 +110,36 @@ function parseApiError(data: unknown, fallback: string): string {
       : `Sem perguntas suficientes. Crie mais documentos em "quiz_questions" com active=true.`;
   }
 
+  if (code === "session_not_found") {
+    return "Sessão do quiz não encontrada (reinicie a partida).";
+  }
+
+  if (code === "bad_request") {
+    const detail = typeof data.detail === "string" ? data.detail : null;
+    return detail ? `Requisição inválida: ${detail}` : "Requisição inválida.";
+  }
+
+  if (code === "server_error") {
+    const detail = typeof data.detail === "string" ? data.detail : null;
+    return detail ? `Erro no servidor: ${detail}` : "Erro no servidor.";
+  }
+
   return code;
+}
+
+async function readJsonOrText(res: Response): Promise<{
+  rawText: string;
+  data: unknown;
+}> {
+  const rawText = await res.text();
+
+  if (!rawText) return { rawText: "", data: {} };
+
+  try {
+    return { rawText, data: JSON.parse(rawText) as unknown };
+  } catch {
+    return { rawText, data: {} };
+  }
 }
 
 export default function QuizClassico() {
@@ -143,6 +175,7 @@ export default function QuizClassico() {
 
     try {
       const token = await user.getIdToken();
+
       const res = await fetch("/api/quiz/start", {
         method: "POST",
         headers: {
@@ -152,10 +185,13 @@ export default function QuizClassico() {
         body: JSON.stringify({ mode: "classic", count: 10 }),
       });
 
-      const data: unknown = await res.json().catch(() => ({}));
+      const { rawText, data } = await readJsonOrText(res);
 
       if (!res.ok) {
-        throw new Error(parseApiError(data, "Falha ao iniciar"));
+        const fallback = `Falha ao iniciar (HTTP ${res.status})${
+          rawText ? `: ${rawText.slice(0, 180)}` : ""
+        }`;
+        throw new Error(parseApiError(data, fallback));
       }
 
       const ok = parseStartOk(data);
@@ -180,6 +216,7 @@ export default function QuizClassico() {
 
     try {
       const token = await user.getIdToken();
+
       const res = await fetch("/api/quiz/submit", {
         method: "POST",
         headers: {
@@ -189,10 +226,13 @@ export default function QuizClassico() {
         body: JSON.stringify({ sessionId, answers }),
       });
 
-      const data: unknown = await res.json().catch(() => ({}));
+      const { rawText, data } = await readJsonOrText(res);
 
       if (!res.ok) {
-        throw new Error(parseApiError(data, "Falha ao enviar"));
+        const fallback = `Falha ao enviar (HTTP ${res.status})${
+          rawText ? `: ${rawText.slice(0, 180)}` : ""
+        }`;
+        throw new Error(parseApiError(data, fallback));
       }
 
       const ok = parseSubmitOk(data);

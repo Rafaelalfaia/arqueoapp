@@ -1,92 +1,35 @@
+// src/lib/firebase/admin.ts
 import "server-only";
 
-import fs from "node:fs";
 import {
-  applicationDefault,
-  cert,
   getApps,
   initializeApp,
+  applicationDefault,
+  cert,
 } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
+import { getAuth } from "firebase-admin/auth";
 
-type ServiceAccountLike = {
-  projectId: string;
-  clientEmail: string;
-  privateKey: string;
-};
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return !!v && typeof v === "object" && !Array.isArray(v);
-}
-
-function parseServiceAccountObject(obj: unknown): ServiceAccountLike | null {
-  if (!isRecord(obj)) return null;
-
-  const project_id = obj.project_id;
-  const client_email = obj.client_email;
-  const private_key = obj.private_key;
-
-  if (
-    typeof project_id !== "string" ||
-    typeof client_email !== "string" ||
-    typeof private_key !== "string"
-  ) {
-    return null;
-  }
-
-  return {
-    projectId: project_id.trim(),
-    clientEmail: client_email.trim(),
-    privateKey: private_key.replace(/\\n/g, "\n"),
-  };
-}
-
-function getProjectIdFromEnv(): string | undefined {
-  const v =
-    process.env.FIREBASE_PROJECT_ID ||
-    process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ||
-    process.env.GCLOUD_PROJECT ||
-    process.env.GOOGLE_CLOUD_PROJECT;
-
-  return typeof v === "string" && v.trim() ? v.trim() : undefined;
-}
-
-function getServiceAccountFromCredentialsFile(): ServiceAccountLike | null {
-  const p = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (!p || typeof p !== "string") return null;
-  if (!fs.existsSync(p)) return null;
-
-  try {
-    const raw = fs.readFileSync(p, "utf8");
-    return parseServiceAccountObject(JSON.parse(raw));
-  } catch {
-    return null;
-  }
-}
-
-export function getAdminApp() {
+function initAdmin() {
   if (getApps().length) return getApps()[0];
 
-  const sa = getServiceAccountFromCredentialsFile();
-  const projectId = getProjectIdFromEnv() || sa?.projectId;
+  // Opção 1: credenciais via .env (produção)
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
-  if (sa) {
+  if (projectId && clientEmail && privateKey) {
     return initializeApp({
-      credential: cert({
-        projectId: sa.projectId,
-        clientEmail: sa.clientEmail,
-        privateKey: sa.privateKey,
-      }),
-      projectId,
+      credential: cert({ projectId, clientEmail, privateKey }),
     });
   }
 
+  // Opção 2: credenciais via GOOGLE_APPLICATION_CREDENTIALS (seu dev local)
   return initializeApp({
     credential: applicationDefault(),
-    projectId,
   });
 }
 
-export const adminDb = () => getFirestore(getAdminApp());
-export const adminAuth = () => getAuth(getAdminApp());
+export const adminApp = initAdmin();
+export const adminDb = getFirestore(adminApp);
+export const adminAuth = getAuth(adminApp);
