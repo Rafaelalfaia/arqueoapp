@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/lib/auth/AuthProvider";
 
 type TournamentType = "recurring" | "special";
@@ -13,6 +13,7 @@ type ListItem = {
   questionCount?: number;
   maxParticipants?: number;
   startAtMs?: number;
+  coverUrl?: string;
 };
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -42,6 +43,8 @@ function formatDate(ms?: number): string {
 
 type Tab = "all" | "recurring" | "special";
 
+const FALLBACK_COVER = "/covers/tournaments/fallback.jpg"; // crie esta imagem no /public
+
 export default function AdminTorneiosClient() {
   const { user } = useAuth();
 
@@ -62,13 +65,21 @@ export default function AdminTorneiosClient() {
   const [entryFeeDiamonds, setEntryFeeDiamonds] = useState(0);
   const [prizePoolDiamonds, setPrizePoolDiamonds] = useState(0);
 
+  // upload cover
+  const [coverFile, setCoverFile] = useState<File | null>(null);
+  const [coverPreviewUrl, setCoverPreviewUrl] = useState<string>("");
+
   const canCreate = useMemo(() => {
     if (title.trim().length < 3) return false;
     if (!(questionCount >= 1)) return false;
     if (type === "recurring" && !(maxParticipants >= 2)) return false;
     if (type === "special" && startAtLocal.trim().length < 8) return false;
+
+    // agora é obrigatório ter arquivo
+    if (!coverFile) return false;
+
     return true;
-  }, [title, questionCount, type, maxParticipants, startAtLocal]);
+  }, [title, questionCount, type, maxParticipants, startAtLocal, coverFile]);
 
   const filtered = useMemo(() => {
     const qq = q.trim().toLowerCase();
@@ -81,32 +92,59 @@ export default function AdminTorneiosClient() {
     });
   }, [items, tab, q]);
 
-  async function getToken(): Promise<string> {
+  const getToken = useCallback(async (): Promise<string> => {
     if (!user) throw new Error("UNAUTHENTICATED");
     return user.getIdToken(true);
-  }
+  }, [user]);
 
-  async function loadList(): Promise<void> {
+  const loadList = useCallback(async (): Promise<void> => {
     setError("");
     setLoadingList(true);
+
     try {
-      const res = await fetch("/api/tournament/list", { method: "GET" });
-      const json: unknown = await res.json();
+      const token = await getToken();
+
+      const url = "/api/tournament/list";
+      const res = await fetch(url, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      const ct = res.headers.get("content-type") ?? "";
+      const text = await res.text();
+
+      if (!ct.includes("application/json")) {
+        throw new Error(
+          [
+            "API não retornou JSON.",
+            `status=${res.status}`,
+            `redirected=${res.redirected}`,
+            `url=${res.url}`,
+            `content-type=${ct}`,
+            `body[0..120]=${JSON.stringify(text.slice(0, 120))}`,
+          ].join(" | ")
+        );
+      }
+
+      const json: unknown = JSON.parse(text);
+
       if (!res.ok) {
         const msg = isRecord(json) ? readString(json, "error") : undefined;
-        throw new Error(msg ?? "Falha ao carregar torneios");
+        throw new Error(msg ?? `Falha ao carregar torneios (${res.status})`);
       }
-      if (!isRecord(json)) throw new Error("RESPOSTA_INVALIDA");
 
+      if (!isRecord(json)) throw new Error("RESPOSTA_INVALIDA");
       const rawArr = (json.tournaments ?? json.items) as unknown;
       if (!Array.isArray(rawArr)) throw new Error("RESPOSTA_INVALIDA");
 
       const parsed: ListItem[] = [];
       for (const it of rawArr) {
         if (!isRecord(it)) continue;
+
         const id = readString(it, "id") ?? readString(it, "tournamentId");
         const ttl = readString(it, "title");
-        const tp = coerceType(it.type);
+        const tp = coerceType(it["type"]); // evita warning TS
+
         if (!id || !ttl || !tp) continue;
 
         parsed.push({
@@ -117,6 +155,7 @@ export default function AdminTorneiosClient() {
           questionCount: readNumber(it, "questionCount"),
           maxParticipants: readNumber(it, "maxParticipants"),
           startAtMs: readNumber(it, "startAtMs"),
+          coverUrl: readString(it, "coverUrl"),
         });
       }
 
@@ -126,50 +165,101 @@ export default function AdminTorneiosClient() {
     } finally {
       setLoadingList(false);
     }
-  }
+  }, [getToken]);
 
+  // só carrega quando user existir (remove ~~~~ de hooks)
   useEffect(() => {
+    if (!user) return;
     void loadList();
+  }, [user, loadList]);
+
+  // preview da imagem (e limpeza do objectURL)
+  useEffect(() => {
+    if (!coverFile) {
+      setCoverPreviewUrl("");
+      return;
+    }
+    const url = URL.createObjectURL(coverFile);
+    setCoverPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [coverFile]);
+
+  const onPickCover = useCallback((file: File | null) => {
+    setError("");
+    if (!file) {
+      setCoverFile(null);
+      return;
+    }
+
+    // validação básica
+    const okTypes = ["image/jpeg", "image/png", "image/webp"];
+    if (!okTypes.includes(file.type)) {
+      setError("Formato inválido. Envie JPG, PNG ou WEBP.");
+      setCoverFile(null);
+      return;
+    }
+
+    const maxBytes = 4 * 1024 * 1024; // 4MB
+    if (file.size > maxBytes) {
+      setError("Arquivo muito grande. Máximo: 4MB.");
+      setCoverFile(null);
+      return;
+    }
+
+    setCoverFile(file);
   }, []);
 
-  async function onCreate(): Promise<void> {
+  const onCreate = useCallback(async (): Promise<void> => {
     setError("");
     if (!canCreate) return;
+    if (!coverFile) {
+      setError("Selecione uma imagem de capa.");
+      return;
+    }
 
     setLoadingCreate(true);
     try {
       const token = await getToken();
 
-      const payload: Record<string, unknown> = {
-        type,
-        title: title.trim(),
-        description: description.trim(),
-        questionCount,
-        maxParticipants: type === "recurring" ? maxParticipants : undefined,
-        startAt:
-          type === "special" ? new Date(startAtLocal).toISOString() : undefined,
-        entryFeeDiamonds,
-        prizePoolDiamonds,
+      // FormData com arquivo
+      const fd = new FormData();
+      fd.set("type", type);
+      fd.set("title", title.trim());
+      fd.set("description", description.trim());
+      fd.set("questionCount", String(questionCount));
+      fd.set("entryFeeDiamonds", String(entryFeeDiamonds));
+      fd.set("prizePoolDiamonds", String(prizePoolDiamonds));
 
-        // NÃO enviar split — servidor aplica 50/30/20 fixo
-      };
+      if (type === "recurring") {
+        fd.set("maxParticipants", String(maxParticipants));
+      } else {
+        fd.set("startAt", new Date(startAtLocal).toISOString());
+      }
+
+      fd.set("cover", coverFile, coverFile.name);
 
       const res = await fetch("/api/tournament/admin/create", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
+          // NÃO setar Content-Type; o browser define boundary
         },
-        body: JSON.stringify(payload),
+        body: fd,
       });
 
-      const json: unknown = await res.json();
+      const ct = res.headers.get("content-type") ?? "";
+      const raw = await res.text();
+      const json: unknown = ct.includes("application/json")
+        ? JSON.parse(raw)
+        : {};
+
       if (!res.ok) {
         const msg = isRecord(json) ? readString(json, "error") : undefined;
-        throw new Error(msg ?? "Falha ao criar torneio");
+        throw new Error(msg ?? `Falha ao criar torneio (${res.status})`);
       }
 
       // reset
+      setType("recurring");
       setTitle("");
       setDescription("");
       setQuestionCount(10);
@@ -177,6 +267,7 @@ export default function AdminTorneiosClient() {
       setStartAtLocal("");
       setEntryFeeDiamonds(0);
       setPrizePoolDiamonds(0);
+      setCoverFile(null);
 
       await loadList();
     } catch (e: unknown) {
@@ -184,11 +275,24 @@ export default function AdminTorneiosClient() {
     } finally {
       setLoadingCreate(false);
     }
-  }
+  }, [
+    canCreate,
+    coverFile,
+    description,
+    entryFeeDiamonds,
+    getToken,
+    loadList,
+    maxParticipants,
+    prizePoolDiamonds,
+    questionCount,
+    startAtLocal,
+    title,
+    type,
+  ]);
 
   return (
     <div className="grid gap-4">
-      {/* Banner / Capa */}
+      {/* Banner */}
       <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-black/40">
         <div
           className="h-40 w-full bg-cover bg-center"
@@ -223,7 +327,7 @@ export default function AdminTorneiosClient() {
       ) : null}
 
       <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
-        {/* Lista estilo “cards” */}
+        {/* Lista */}
         <div className="rounded-2xl border border-white/10 bg-black/40 p-4">
           <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             <div className="flex gap-2">
@@ -262,37 +366,51 @@ export default function AdminTorneiosClient() {
           </div>
 
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            {filtered.map((t) => (
-              <div
-                key={t.id}
-                className="rounded-xl border border-white/10 bg-black/50 p-4"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
+            {filtered.map((t) => {
+              const img = t.coverUrl?.trim() ? t.coverUrl : FALLBACK_COVER;
+
+              return (
+                <div
+                  key={t.id}
+                  className="overflow-hidden rounded-xl border border-white/10 bg-black/50"
+                >
+                  <div className="relative">
+                    <div
+                      className="h-24 w-full bg-cover bg-center"
+                      style={{ backgroundImage: `url(${img})` }}
+                    />
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/10 to-transparent" />
+                    <div className="absolute right-3 top-3">
+                      <span className="rounded-md border border-white/10 bg-black/40 px-2 py-1 text-xs">
+                        {t.type === "recurring" ? "Recorrente" : "Especial"}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="p-4">
                     <div className="text-base font-semibold">{t.title}</div>
                     <div className="text-xs opacity-70 font-mono mt-1">
                       {t.id}
                     </div>
-                  </div>
-                  <span className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs">
-                    {t.type === "recurring" ? "Recorrente" : "Especial"}
-                  </span>
-                </div>
 
-                <div className="mt-3 grid grid-cols-2 gap-2 text-sm opacity-90">
-                  <div>Perguntas: {t.questionCount ?? "-"}</div>
-                  <div>Status: {t.status ?? "-"}</div>
-                  <div>
-                    Máx:{" "}
-                    {t.type === "recurring" ? t.maxParticipants ?? "-" : "-"}
-                  </div>
-                  <div>
-                    Início:{" "}
-                    {t.type === "special" ? formatDate(t.startAtMs) : "-"}
+                    <div className="mt-3 grid grid-cols-2 gap-2 text-sm opacity-90">
+                      <div>Perguntas: {t.questionCount ?? "-"}</div>
+                      <div>Status: {t.status ?? "-"}</div>
+                      <div>
+                        Máx:{" "}
+                        {t.type === "recurring"
+                          ? t.maxParticipants ?? "-"
+                          : "-"}
+                      </div>
+                      <div>
+                        Início:{" "}
+                        {t.type === "special" ? formatDate(t.startAtMs) : "-"}
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
 
             {filtered.length === 0 ? (
               <div className="rounded-xl border border-white/10 bg-black/50 p-4 opacity-70 sm:col-span-2">
@@ -310,6 +428,30 @@ export default function AdminTorneiosClient() {
           </div>
 
           <div className="mt-4 grid gap-3">
+            {/* Upload da capa */}
+            <label className="grid gap-1">
+              <span className="text-sm opacity-80">
+                Imagem de capa (obrigatório)
+              </span>
+              <input
+                className="rounded-lg border border-white/10 bg-black/60 p-2 text-sm"
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                onChange={(e) => onPickCover(e.target.files?.[0] ?? null)}
+              />
+              <div className="mt-2 overflow-hidden rounded-xl border border-white/10">
+                <div
+                  className="h-24 w-full bg-cover bg-center"
+                  style={{
+                    backgroundImage: `url(${
+                      coverPreviewUrl || FALLBACK_COVER
+                    })`,
+                  }}
+                />
+              </div>
+              <div className="text-xs opacity-70">JPG/PNG/WEBP, até 4MB.</div>
+            </label>
+
             <label className="grid gap-1">
               <span className="text-sm opacity-80">Tipo</span>
               <select
