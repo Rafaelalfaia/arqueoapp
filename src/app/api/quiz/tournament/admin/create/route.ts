@@ -1,30 +1,19 @@
 import { NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase/admin";
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { FieldValue } from "firebase-admin/firestore";
 
-import {
-  COL,
-  DEFAULTS,
-  type TournamentType,
-  type TournamentStatus,
-} from "@/lib/tournament/config";
-import {
-  requireAdmin,
-  assertNumber,
-  assertTournamentType,
-  tsFromISO,
-  normalizePrizeSplit,
-} from "@/lib/tournament/server";
+import { COL, DEFAULTS, type TournamentType } from "@/lib/tournament/config";
+import { requireAdmin, tsFromISO, nowMs } from "@/lib/tournament/server";
 
 export const runtime = "nodejs";
 
-/** Guards locais (sem any) */
+/** parsing (sem any, sem null) */
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 function asRecord(v: unknown): Record<string, unknown> {
-  if (!isRecord(v)) throw new Error("BODY_INVALIDO");
+  if (!isRecord(v)) throw new Error("DADOS_INVALIDOS");
   return v;
 }
 
@@ -44,106 +33,139 @@ function readNumber(
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+function coerceType(v: unknown): TournamentType | undefined {
+  return v === "recurring" || v === "special" ? v : undefined;
+}
+
+function clampInt(n: number, min: number, max: number): number {
+  const x = Math.trunc(n);
+  if (x < min) return min;
+  if (x > max) return max;
+  return x;
+}
+
 export async function POST(req: Request) {
   try {
-    await requireAdmin(req);
+    // Admin via token/claims (e refresh server-side no requireAdmin)
+    const admin = await requireAdmin(req);
 
     const body = asRecord(await req.json());
 
-    const type: TournamentType = assertTournamentType(body.type);
+    const type = coerceType(body.type);
+    if (!type) {
+      return NextResponse.json({ error: "type inválido" }, { status: 400 });
+    }
 
     const title = (readString(body, "title") ?? "").trim();
-    if (!title)
-      return NextResponse.json({ error: "title obrigatório" }, { status: 400 });
-
-    const descriptionRaw = readString(body, "description");
-    const description = descriptionRaw ? descriptionRaw.trim() : undefined;
-
-    const questionCount = assertNumber("questionCount", body.questionCount);
-    if (questionCount < 1 || questionCount > 50) {
+    if (title.length < 3) {
       return NextResponse.json(
-        { error: "questionCount fora do limite (1..50)" },
+        { error: "title obrigatório (>= 3)" },
         { status: 400 }
       );
     }
 
-    const entryFeeDiamonds = readNumber(body, "entryFeeDiamonds") ?? 0;
-    const prizePoolDiamonds = readNumber(body, "prizePoolDiamonds") ?? 0;
+    const description = (readString(body, "description") ?? "").trim();
 
-    const graceMinutes =
-      readNumber(body, "graceMinutes") ?? DEFAULTS.graceMinutes;
-    const recurringJoinMinutes =
-      readNumber(body, "recurringJoinMinutes") ?? DEFAULTS.recurringJoinMinutes;
-    const maxPlayMinutes =
-      readNumber(body, "maxPlayMinutes") ?? DEFAULTS.maxPlayMinutes;
+    const rawQC = readNumber(body, "questionCount");
+    const questionCount = rawQC ? clampInt(rawQC, 1, 50) : 0;
+    if (questionCount < 1) {
+      return NextResponse.json(
+        { error: "questionCount inválido" },
+        { status: 400 }
+      );
+    }
 
-    const prizeSplit = normalizePrizeSplit(body.prizeSplit);
+    const entryFeeDiamonds = clampInt(
+      readNumber(body, "entryFeeDiamonds") ?? 0,
+      0,
+      1_000_000
+    );
+    const prizePoolDiamonds = clampInt(
+      readNumber(body, "prizePoolDiamonds") ?? 0,
+      0,
+      1_000_000
+    );
 
-    let startAt: Timestamp | undefined;
+    // opcional: capa do torneio
+    const coverUrl = (readString(body, "coverUrl") ?? "").trim() || undefined;
+
+    // Regra fixa: 50/30/20 SEMPRE no servidor
+    const prizeSplit = DEFAULTS.prizeSplit; // { first:0.5, second:0.3, third:0.2 }
+
+    const now = nowMs();
+
+    // status automático (MVP): não depender de “publish” ainda
+    let status: "open" | "scheduled" | "live" = "open";
+
+    // Campos específicos
     let maxParticipants: number | undefined;
-    let status: TournamentStatus;
+    let startAt: ReturnType<typeof tsFromISO> | undefined;
+    const graceMinutes = DEFAULTS.graceMinutes;
 
     if (type === "recurring") {
-      status = "open";
-      const mp = readNumber(body, "maxParticipants") ?? 20;
-      if (mp < 2 || mp > 5000) {
+      const rawMax = readNumber(body, "maxParticipants");
+      const mp = rawMax ? clampInt(rawMax, 2, 10_000) : 0;
+      if (mp < 2) {
         return NextResponse.json(
-          { error: "maxParticipants fora do limite (2..5000)" },
+          { error: "maxParticipants inválido (>= 2)" },
           { status: 400 }
         );
       }
       maxParticipants = mp;
+      status = "open";
     } else {
-      status = "scheduled";
-      const startAtISO = readString(body, "startAt");
-      if (!startAtISO) {
+      const startAtIso = (readString(body, "startAt") ?? "").trim();
+      if (!startAtIso) {
         return NextResponse.json(
-          { error: "startAt obrigatório no special (ISO)" },
+          { error: "startAt obrigatório (ISO)" },
           { status: 400 }
         );
       }
-      startAt = tsFromISO(startAtISO);
+      startAt = tsFromISO(startAtIso);
+      status = startAt.toMillis() <= now ? "live" : "scheduled";
     }
 
-    const ref = adminDb.collection(COL.tournaments).doc();
+    const tRef = adminDb.collection(COL.tournaments).doc();
 
-    // Monta payload sem undefined (para não quebrar no Firestore)
-    const payload: Record<string, unknown> = {
+    await tRef.set({
       type,
       title,
-      status,
+      description: description || undefined,
+      coverUrl,
 
+      status,
       questionCount,
 
-      graceMinutes,
-      recurringJoinMinutes,
-      maxPlayMinutes,
+      // recurring
+      maxParticipants: type === "recurring" ? maxParticipants : undefined,
 
+      // special
+      startAt: type === "special" ? startAt : undefined,
+      graceMinutes,
+
+      // economia/premiação
       entryFeeDiamonds,
       prizePoolDiamonds,
-      prizeSplit,
+      prizeSplit, // fixo 50/30/20
+
+      // controle/metadata
+      createdBy: admin.uid,
+      activeInstanceId: type === "recurring" ? undefined : undefined,
 
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
-    };
+    });
 
-    if (description && description.length > 0)
-      payload.description = description;
-    if (typeof maxParticipants === "number")
-      payload.maxParticipants = maxParticipants;
-    if (startAt) payload.startAt = startAt;
-
-    await ref.set(payload);
-
-    return NextResponse.json({ ok: true, tournamentId: ref.id });
+    return NextResponse.json({ ok: true, tournamentId: tRef.id });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Erro";
+
     const status =
       msg === "UNAUTHENTICATED"
         ? 401
         : msg === "FORBIDDEN"
         ? 403
-        : msg === "BODY_INVALIDO"
+        : msg === "DADOS_INVALIDOS"
         ? 400
         : 500;
 

@@ -35,9 +35,13 @@ export type TournamentDefaults = {
  * IMPORTANTE: não usar `as const` aqui para evitar readonly/compatibilidade
  * que costuma gerar ~~~~ em alguns setups.
  */
-export const DEFAULTS: TournamentDefaults = {
+export const DEFAULTS = {
   graceMinutes: 10,
   recurringJoinMinutes: 5,
   maxPlayMinutes: 20,
+
+  // Regra fixa:
   prizeSplit: { first: 0.5, second: 0.3, third: 0.2 },
-};
+
+  // ...o resto que você já tem
+} as const;

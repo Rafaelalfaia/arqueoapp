@@ -19,11 +19,19 @@ export default function AdminHome() {
   return (
     <main className="p-6 max-w-3xl mx-auto">
       <h1 className="text-2xl font-semibold">Painel Admin</h1>
+
       <div className="mt-4 space-y-2">
         <Link className="underline" href="/admin/perguntas">
           Perguntas do Quiz
         </Link>
+
         <div>
+          <Link className="underline" href="/admin/torneios">
+            Torneios
+          </Link>
+        </div>
+
+        <div className="pt-2">
           <Link className="underline" href="/perfil">
             Voltar ao perfil
           </Link>
