@@ -1,9 +1,12 @@
+// C:\Users\rafae\arqueoapp\src\app\(admin)\admin\torneios\_components\AdminTorneiosClient.tsx
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/lib/auth/AuthProvider";
 
 type TournamentType = "recurring" | "special";
+
+type Tab = "all" | "recurring" | "special";
 
 type ListItem = {
   id: string;
@@ -16,9 +19,15 @@ type ListItem = {
   coverUrl?: string;
 };
 
+const FALLBACK_COVER = "/covers/tournaments/fallback.jpg"; // coloque no /public
+
+/** ============================
+ * Helpers (sem any, sem null)
+ * ============================ */
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
+
 function readString(
   obj: Record<string, unknown>,
   key: string
@@ -26,6 +35,7 @@ function readString(
   const v = obj[key];
   return typeof v === "string" ? v : undefined;
 }
+
 function readNumber(
   obj: Record<string, unknown>,
   key: string
@@ -33,23 +43,72 @@ function readNumber(
   const v = obj[key];
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
+
 function coerceType(v: unknown): TournamentType | undefined {
   return v === "recurring" || v === "special" ? v : undefined;
 }
+
 function formatDate(ms?: number): string {
   if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "-";
   return new Date(ms).toLocaleString("pt-BR");
 }
 
-type Tab = "all" | "recurring" | "special";
+function safeJsonParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
 
-const FALLBACK_COVER = "/covers/tournaments/fallback.jpg"; // crie esta imagem no /public
+function buildNonJsonError(res: Response, ct: string, bodyText: string): Error {
+  return new Error(
+    [
+      "API não retornou JSON.",
+      `status=${res.status}`,
+      `redirected=${res.redirected}`,
+      `url=${res.url}`,
+      `content-type=${ct}`,
+      `body[0..200]=${JSON.stringify(bodyText.slice(0, 200))}`,
+    ].join(" | ")
+  );
+}
 
+async function readJsonOrThrow(
+  res: Response
+): Promise<Record<string, unknown>> {
+  const ct = res.headers.get("content-type") ?? "";
+  const text = await res.text();
+
+  if (!ct.includes("application/json")) {
+    throw buildNonJsonError(res, ct, text);
+  }
+
+  const parsed = safeJsonParse(text);
+  if (!parsed || !isRecord(parsed)) {
+    throw new Error(
+      `JSON inválido. body[0..200]=${JSON.stringify(text.slice(0, 200))}`
+    );
+  }
+
+  // Se backend retornar { error }, respeita.
+  if (!res.ok) {
+    const msg = readString(parsed, "error");
+    throw new Error(msg ?? `Falha HTTP (${res.status})`);
+  }
+
+  return parsed;
+}
+
+/** ============================
+ * Component
+ * ============================ */
 export default function AdminTorneiosClient() {
   const { user } = useAuth();
 
   const [tab, setTab] = useState<Tab>("all");
   const [q, setQ] = useState("");
+
   const [items, setItems] = useState<ListItem[]>([]);
   const [loadingList, setLoadingList] = useState(false);
   const [loadingCreate, setLoadingCreate] = useState(false);
@@ -67,19 +126,25 @@ export default function AdminTorneiosClient() {
 
   // upload cover
   const [coverFile, setCoverFile] = useState<File | null>(null);
-  const [coverPreviewUrl, setCoverPreviewUrl] = useState<string>("");
+  const [coverPreviewUrl, setCoverPreviewUrl] = useState("");
 
   const canCreate = useMemo(() => {
+    if (!user) return false;
     if (title.trim().length < 3) return false;
     if (!(questionCount >= 1)) return false;
     if (type === "recurring" && !(maxParticipants >= 2)) return false;
     if (type === "special" && startAtLocal.trim().length < 8) return false;
-
-    // agora é obrigatório ter arquivo
     if (!coverFile) return false;
-
     return true;
-  }, [title, questionCount, type, maxParticipants, startAtLocal, coverFile]);
+  }, [
+    user,
+    title,
+    questionCount,
+    type,
+    maxParticipants,
+    startAtLocal,
+    coverFile,
+  ]);
 
   const filtered = useMemo(() => {
     const qq = q.trim().toLowerCase();
@@ -98,42 +163,21 @@ export default function AdminTorneiosClient() {
   }, [user]);
 
   const loadList = useCallback(async (): Promise<void> => {
+    if (!user) return;
+
     setError("");
     setLoadingList(true);
 
     try {
       const token = await getToken();
 
-      const url = "/api/tournament/list";
-      const res = await fetch(url, {
+      const res = await fetch("/api/tournament/list", {
         method: "GET",
         headers: { Authorization: `Bearer ${token}` },
       });
 
-      const ct = res.headers.get("content-type") ?? "";
-      const text = await res.text();
+      const json = await readJsonOrThrow(res);
 
-      if (!ct.includes("application/json")) {
-        throw new Error(
-          [
-            "API não retornou JSON.",
-            `status=${res.status}`,
-            `redirected=${res.redirected}`,
-            `url=${res.url}`,
-            `content-type=${ct}`,
-            `body[0..120]=${JSON.stringify(text.slice(0, 120))}`,
-          ].join(" | ")
-        );
-      }
-
-      const json: unknown = JSON.parse(text);
-
-      if (!res.ok) {
-        const msg = isRecord(json) ? readString(json, "error") : undefined;
-        throw new Error(msg ?? `Falha ao carregar torneios (${res.status})`);
-      }
-
-      if (!isRecord(json)) throw new Error("RESPOSTA_INVALIDA");
       const rawArr = (json.tournaments ?? json.items) as unknown;
       if (!Array.isArray(rawArr)) throw new Error("RESPOSTA_INVALIDA");
 
@@ -143,8 +187,7 @@ export default function AdminTorneiosClient() {
 
         const id = readString(it, "id") ?? readString(it, "tournamentId");
         const ttl = readString(it, "title");
-        const tp = coerceType(it["type"]); // evita warning TS
-
+        const tp = coerceType(it["type"]);
         if (!id || !ttl || !tp) continue;
 
         parsed.push({
@@ -165,15 +208,15 @@ export default function AdminTorneiosClient() {
     } finally {
       setLoadingList(false);
     }
-  }, [getToken]);
+  }, [user, getToken]);
 
-  // só carrega quando user existir (remove ~~~~ de hooks)
+  // carrega lista quando tiver user
   useEffect(() => {
     if (!user) return;
     void loadList();
   }, [user, loadList]);
 
-  // preview da imagem (e limpeza do objectURL)
+  // preview da imagem (limpa objectURL)
   useEffect(() => {
     if (!coverFile) {
       setCoverPreviewUrl("");
@@ -186,12 +229,12 @@ export default function AdminTorneiosClient() {
 
   const onPickCover = useCallback((file: File | null) => {
     setError("");
+
     if (!file) {
       setCoverFile(null);
       return;
     }
 
-    // validação básica
     const okTypes = ["image/jpeg", "image/png", "image/webp"];
     if (!okTypes.includes(file.type)) {
       setError("Formato inválido. Envie JPG, PNG ou WEBP.");
@@ -212,16 +255,22 @@ export default function AdminTorneiosClient() {
   const onCreate = useCallback(async (): Promise<void> => {
     setError("");
     if (!canCreate) return;
+
+    if (!user) {
+      setError("UNAUTHENTICATED");
+      return;
+    }
+
     if (!coverFile) {
       setError("Selecione uma imagem de capa.");
       return;
     }
 
     setLoadingCreate(true);
+
     try {
       const token = await getToken();
 
-      // FormData com arquivo
       const fd = new FormData();
       fd.set("type", type);
       fd.set("title", title.trim());
@@ -242,21 +291,12 @@ export default function AdminTorneiosClient() {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
-          // NÃO setar Content-Type; o browser define boundary
+          // NÃO setar Content-Type (o browser define boundary do multipart)
         },
         body: fd,
       });
 
-      const ct = res.headers.get("content-type") ?? "";
-      const raw = await res.text();
-      const json: unknown = ct.includes("application/json")
-        ? JSON.parse(raw)
-        : {};
-
-      if (!res.ok) {
-        const msg = isRecord(json) ? readString(json, "error") : undefined;
-        throw new Error(msg ?? `Falha ao criar torneio (${res.status})`);
-      }
+      await readJsonOrThrow(res);
 
       // reset
       setType("recurring");
@@ -277,17 +317,18 @@ export default function AdminTorneiosClient() {
     }
   }, [
     canCreate,
+    user,
     coverFile,
-    description,
-    entryFeeDiamonds,
     getToken,
-    loadList,
-    maxParticipants,
-    prizePoolDiamonds,
-    questionCount,
-    startAtLocal,
-    title,
     type,
+    title,
+    description,
+    questionCount,
+    entryFeeDiamonds,
+    prizePoolDiamonds,
+    maxParticipants,
+    startAtLocal,
+    loadList,
   ]);
 
   return (
@@ -309,7 +350,8 @@ export default function AdminTorneiosClient() {
           <button
             className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-sm disabled:opacity-50"
             onClick={() => void loadList()}
-            disabled={loadingList}
+            disabled={loadingList || !user}
+            title={!user ? "Faça login para carregar" : undefined}
           >
             {loadingList ? "Carregando…" : "Recarregar"}
           </button>
@@ -439,6 +481,7 @@ export default function AdminTorneiosClient() {
                 accept="image/jpeg,image/png,image/webp"
                 onChange={(e) => onPickCover(e.target.files?.[0] ?? null)}
               />
+
               <div className="mt-2 overflow-hidden rounded-xl border border-white/10">
                 <div
                   className="h-24 w-full bg-cover bg-center"
@@ -449,6 +492,7 @@ export default function AdminTorneiosClient() {
                   }}
                 />
               </div>
+
               <div className="text-xs opacity-70">JPG/PNG/WEBP, até 4MB.</div>
             </label>
 
@@ -556,6 +600,7 @@ export default function AdminTorneiosClient() {
               className="rounded-lg border border-white/10 bg-white/10 px-4 py-2 text-sm disabled:opacity-50"
               disabled={loadingCreate || !canCreate}
               onClick={() => void onCreate()}
+              title={!user ? "Faça login como admin" : undefined}
             >
               {loadingCreate ? "Criando…" : "Criar torneio"}
             </button>

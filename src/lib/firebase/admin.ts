@@ -11,15 +11,29 @@ import { getFirestore } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 
+function normalizeBucketName(v: string | undefined): string | undefined {
+  if (!v) return undefined;
+  let x = v.trim();
+  if (!x) return undefined;
+
+  // aceita se veio "gs://bucket"
+  if (x.startsWith("gs://")) x = x.slice("gs://".length);
+
+  // remove barras
+  x = x.replace(/\/+$/, "");
+
+  return x || undefined;
+}
+
 function initAdmin() {
   if (getApps().length) return getApps()[0];
 
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const projectId = process.env.FIREBASE_PROJECT_ID?.trim();
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim();
   const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
   const storageBucket =
-    process.env.FIREBASE_STORAGE_BUCKET ||
+    normalizeBucketName(process.env.FIREBASE_STORAGE_BUCKET) ||
     (projectId ? `${projectId}.appspot.com` : undefined);
 
   if (projectId && clientEmail && privateKey) {

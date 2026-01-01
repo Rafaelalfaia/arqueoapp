@@ -57,8 +57,8 @@ function readStringArray(
 ): string[] | undefined {
   const v = obj[key];
   if (!Array.isArray(v)) return undefined;
-  const onlyStrings = v.filter(isString);
-  return onlyStrings.length === v.length ? onlyStrings : undefined;
+  for (const it of v) if (!isString(it)) return undefined;
+  return v;
 }
 
 function normalizeRole(s: string | undefined): string | undefined {
@@ -92,25 +92,33 @@ function getBearer(req: Request): string | undefined {
 }
 
 /**
- * Opcional (DEV): se seu token ainda não recebeu custom claim admin,
- * mas o Firestore users/{uid}.role está "admin", você pode habilitar:
- * ALLOW_FIRESTORE_ROLE_FALLBACK=true
- *
- * Em produção, mantenha false.
+ * DEV fallback:
+ * - Em produção: só usa se ALLOW_FIRESTORE_ROLE_FALLBACK === "true"
+ * - Em desenvolvimento: habilita por padrão, a menos que ALLOW_FIRESTORE_ROLE_FALLBACK === "false"
  */
+function firestoreFallbackEnabled(): boolean {
+  const env = process.env.ALLOW_FIRESTORE_ROLE_FALLBACK;
+  if (process.env.NODE_ENV === "production") return env === "true";
+  // dev/test: default ON, allow opt-out
+  return env !== "false";
+}
+
 async function getFirestoreRoleIfAllowed(
   uid: string
-): Promise<string | undefined> {
-  if (process.env.ALLOW_FIRESTORE_ROLE_FALLBACK !== "true") return undefined;
+): Promise<"admin" | undefined> {
+  if (!firestoreFallbackEnabled()) return undefined;
 
   const snap = await adminDb.collection(COL.users).doc(uid).get();
   if (!snap.exists) return undefined;
 
-  const u = asRecord(snap.data() as unknown, "USER_INVALIDO");
+  const data = snap.data();
+  if (!data) return undefined;
+
+  const u = asRecord(data as unknown, "USER_INVALIDO");
+
   const role = normalizeRole(readString(u, "role"));
   const rolesArr = normalizeRoles(readStringArray(u, "roles"));
 
-  // se você guarda "admin" em role ou dentro de roles, aceita
   if (role === "admin") return "admin";
   if (rolesArr.includes("admin")) return "admin";
   return undefined;
@@ -120,10 +128,11 @@ export async function requireUser(req: Request): Promise<AuthedUser> {
   const token = getBearer(req);
   if (!token) throw new Error("UNAUTHENTICATED");
 
-  const decoded: DecodedIdToken = await adminAuth.verifyIdToken(token);
+  // true => verifica revogação (mais seguro)
+  const decoded: DecodedIdToken = await adminAuth.verifyIdToken(token, true);
   const raw = asRecord(decoded as unknown, "UNAUTHENTICATED");
 
-  // claims
+  // claims possíveis
   const rolesRaw = readStringArray(raw, "roles");
   const roleRaw = readString(raw, "role");
   const adminFlag = readBoolean(raw, "admin");
@@ -140,7 +149,7 @@ export async function requireUser(req: Request): Promise<AuthedUser> {
     roleNorm === "admin" ||
     rolesNorm.includes("admin");
 
-  // fallback DEV: usa Firestore somente se habilitado
+  // fallback (DEV / opcional)
   if (!computedIsAdmin) {
     const dbRole = await getFirestoreRoleIfAllowed(decoded.uid);
     if (dbRole === "admin") computedIsAdmin = true;
@@ -156,7 +165,6 @@ export async function requireUser(req: Request): Promise<AuthedUser> {
 }
 
 export function isAdmin(user: AuthedUser): boolean {
-  // Recalcula de forma robusta (caso-insensitive), sem depender só de "Admin"
   const roleNorm = normalizeRole(user.role);
   const rolesNorm = normalizeRoles(user.roles);
 
@@ -258,6 +266,7 @@ export async function pickQuestionPack(
       throw new Error(`Questão ${d.id} sem correctIndex numérico`);
 
     const pts = readNumber(data, "points");
+
     questionIds.push(d.id);
     correctIndexes.push(ci);
     points.push(isNumber(pts) ? pts : 100);
@@ -280,6 +289,7 @@ export function sanitizeQuestion(id: string, data: unknown): ClientQuestion {
     points: _d,
     ...rest
   } = obj;
+
   return { id, ...rest };
 }
 
@@ -300,7 +310,6 @@ export async function applyDiamondsDeltaTx(
   const curBalance = userSnap.exists
     ? (() => {
         const u = asRecord(userSnap.data() as unknown, "USER_INVALIDO");
-        // prioriza walletBalance, mas aceita diamonds como fallback
         const wb = readNumber(u, "walletBalance");
         const d = readNumber(u, "diamonds");
         const cur = isNumber(wb) ? wb : isNumber(d) ? d : 0;
