@@ -159,8 +159,11 @@ export default function AdminTorneiosClient() {
       });
 
       const json = await readJsonOrThrow(res);
-      const rawArr = (json.tournaments ?? json.items) as unknown;
-      if (!Array.isArray(rawArr)) throw new Error("RESPOSTA_INVALIDA");
+      const rawArr = (json.items ?? json.tournaments) as unknown;
+      if (!Array.isArray(rawArr)) {
+        console.error("Payload inesperado:", json);
+        throw new Error("RESPOSTA_INVALIDA");
+      }
 
       const parsed: ListItem[] = [];
       for (const it of rawArr) {
