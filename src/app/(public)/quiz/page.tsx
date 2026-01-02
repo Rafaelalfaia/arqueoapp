@@ -27,10 +27,15 @@ export default function QuizHome() {
           </div>
         </Link>
 
-        <div className="border rounded p-4 opacity-50">
+        <Link
+          className="border rounded p-4 hover:opacity-90"
+          href="/quiz/torneio"
+        >
           <div className="font-medium">Torneio</div>
-          <div className="text-sm">Em breve</div>
-        </div>
+          <div className="text-sm opacity-80">
+            Recorrentes e Especiais • inscrição e entrada no horário.
+          </div>
+        </Link>
 
         <div className="border rounded p-4 opacity-50">
           <div className="font-medium">Tatuzinho</div>

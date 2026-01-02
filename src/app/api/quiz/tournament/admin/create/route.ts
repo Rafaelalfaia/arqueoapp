@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase/admin";
 import { FieldValue } from "firebase-admin/firestore";
-import { getStorage } from "firebase-admin/storage";
+import { adminStorage } from "@/lib/firebase/admin";
 import crypto from "crypto";
 
 import { COL, DEFAULTS, type TournamentType } from "@/lib/tournament/config";
@@ -156,7 +156,7 @@ export async function POST(req: Request) {
     const tournamentId = tRef.id;
 
     // Upload no Firebase Storage (bucket padrão)
-    const bucket = getStorage().bucket();
+    const bucket = adminStorage.bucket();
     const tokenDownload = crypto.randomUUID();
     const ext = extFromMime(coverEntry.type);
     const objectPath = `tournaments/${tournamentId}/cover.${ext}`;
@@ -174,10 +174,14 @@ export async function POST(req: Request) {
     const encodedPath = encodeURIComponent(objectPath);
     const coverUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedPath}?alt=media&token=${tokenDownload}`;
 
-    await tRef.set({
+    // ... depois de calcular coverUrl etc.
+
+    const data: Record<string, unknown> = {
       type,
       title,
-      description,
+
+      // só grava se vier preenchido
+      ...(description ? { description } : {}),
 
       // capa
       coverUrl,
@@ -185,26 +189,34 @@ export async function POST(req: Request) {
 
       status,
       questionCount,
-
-      // recurring
-      maxParticipants: type === "recurring" ? maxParticipants : undefined,
-
-      // special
-      startAt: type === "special" ? startAt : undefined,
       graceMinutes,
 
       // economia/premiação
       entryFeeDiamonds,
       prizePoolDiamonds,
-      prizeSplit, // fixo 50/30/20
+      prizeSplit,
 
       // controle/metadata
       createdBy: admin.uid,
-      activeInstanceId: undefined,
 
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
-    });
+    };
+
+    if (type === "recurring") {
+      if (typeof maxParticipants !== "number")
+        throw new Error("DADOS_INVALIDOS");
+      data.maxParticipants = maxParticipants;
+    } else {
+      if (!startAt) throw new Error("DADOS_INVALIDOS");
+      data.startAt = startAt;
+      // opcional (ajuda a listar/ordenar sem converter Timestamp no list):
+      data.startAtMs = startAt.toMillis();
+    }
+
+    // Não grave activeInstanceId aqui se não tiver valor real.
+    // (Quando for usar, grave um string id real.)
+    await tRef.set(data);
 
     return NextResponse.json({ ok: true, tournamentId, coverUrl });
   } catch (e: unknown) {

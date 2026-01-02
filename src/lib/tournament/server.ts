@@ -293,23 +293,62 @@ export function sanitizeQuestion(id: string, data: unknown): ClientQuestion {
   return { id, ...rest };
 }
 
-/**
- * Economia (MVP): users/{uid}.walletBalance (principal) + ledger
- * Mantém "diamonds" em sincronia por compatibilidade.
- */
+// === Wallet floor (MVP) ===
+const WALLET_MIN = 50;
+const WALLET_TOPUP_INTERVAL_MS = 60 * 60 * 1000; // 1h
+
+function readTimestampMs(
+  obj: Record<string, unknown>,
+  key: string
+): number | undefined {
+  const v = obj[key];
+  // Timestamp do firebase-admin geralmente tem toMillis()
+  if (v && typeof v === "object" && "toMillis" in v) {
+    const tm = (v as { toMillis?: unknown }).toMillis;
+    if (typeof tm === "function") {
+      const ms = (v as { toMillis: () => number }).toMillis();
+      return Number.isFinite(ms) ? ms : undefined;
+    }
+  }
+  return undefined;
+}
+
+type AnyDocSnap =
+  FirebaseFirestore.DocumentSnapshot<FirebaseFirestore.DocumentData>;
+
+export type ApplyDiamondsOpts = {
+  /**
+   * IMPORTANTE:
+   * Passe o snapshot lido ANTES de qualquer write na transação
+   * para evitar: "all reads before all writes".
+   */
+  userSnap?: AnyDocSnap;
+  nowMs?: number;
+  /**
+   * Default: true (aplica piso 50 se elegível).
+   * Você pode desligar em flows específicos, se quiser.
+   */
+  ensureFloor?: boolean;
+};
+
 export async function applyDiamondsDeltaTx(
   tx: Transaction,
   uid: string,
   delta: number,
   reason: string,
-  meta: Record<string, unknown>
+  meta: Record<string, unknown>,
+  opts?: ApplyDiamondsOpts
 ): Promise<void> {
   const userRef = adminDb.collection(COL.users).doc(uid);
-  const userSnap = await tx.get(userRef);
 
-  const curBalance = userSnap.exists
+  const snap: AnyDocSnap = opts?.userSnap ?? (await tx.get(userRef));
+
+  const now = typeof opts?.nowMs === "number" ? opts!.nowMs : Date.now();
+  const ensureFloor = opts?.ensureFloor !== false;
+
+  const curBalance = snap.exists
     ? (() => {
-        const u = asRecord(userSnap.data() as unknown, "USER_INVALIDO");
+        const u = asRecord(snap.data() as unknown, "USER_INVALIDO");
         const wb = readNumber(u, "walletBalance");
         const d = readNumber(u, "diamonds");
         const cur = isNumber(wb) ? wb : isNumber(d) ? d : 0;
@@ -317,25 +356,69 @@ export async function applyDiamondsDeltaTx(
       })()
     : 0;
 
-  const next = curBalance + delta;
+  let effectiveCur = curBalance;
+  let topupDelta = 0;
+
+  // piso 50 por hora (server-authoritative)
+  if (ensureFloor && effectiveCur < WALLET_MIN) {
+    const u = snap.exists
+      ? asRecord(snap.data() as unknown, "USER_INVALIDO")
+      : undefined;
+
+    const lastTopupMs = u ? readTimestampMs(u, "walletTopupAt") : undefined;
+
+    const canTopup =
+      typeof lastTopupMs !== "number" ||
+      now - lastTopupMs >= WALLET_TOPUP_INTERVAL_MS;
+
+    if (canTopup) {
+      topupDelta = WALLET_MIN - effectiveCur; // > 0
+      effectiveCur = WALLET_MIN;
+    }
+  }
+
+  const next = effectiveCur + delta;
   if (next < 0) throw new Error("SALDO_INSUFICIENTE");
 
-  const payload = {
+  // monta payload sem undefined
+  const userPayload: Record<string, unknown> = {
     walletBalance: next,
     diamonds: next, // compatibilidade MVP
     updatedAt: FieldValue.serverTimestamp(),
   };
 
-  if (!userSnap.exists) {
+  if (topupDelta > 0) {
+    userPayload.walletTopupAt = FieldValue.serverTimestamp();
+  }
+
+  if (!snap.exists) {
     tx.set(
       userRef,
-      { ...payload, createdAt: FieldValue.serverTimestamp() },
+      { uid, ...userPayload, createdAt: FieldValue.serverTimestamp() },
       { merge: true }
     );
   } else {
-    tx.update(userRef, payload);
+    tx.update(userRef, userPayload);
   }
 
+  // ledger do topup (se ocorreu)
+  if (topupDelta > 0) {
+    const topupRef = adminDb.collection(COL.ledger).doc();
+    tx.set(topupRef, {
+      uid,
+      delta: topupDelta,
+      reason: "WALLET_FLOOR_TOPUP",
+      meta: {
+        min: WALLET_MIN,
+        intervalMs: WALLET_TOPUP_INTERVAL_MS,
+        via: "applyDiamondsDeltaTx",
+        triggeredBy: reason,
+      },
+      createdAt: FieldValue.serverTimestamp(),
+    });
+  }
+
+  // ledger do delta principal
   const ledgerRef = adminDb.collection(COL.ledger).doc();
   tx.set(ledgerRef, {
     uid,

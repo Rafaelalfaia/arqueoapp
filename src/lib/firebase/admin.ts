@@ -34,7 +34,8 @@ function initAdmin() {
 
   const storageBucket =
     normalizeBucketName(process.env.FIREBASE_STORAGE_BUCKET) ||
-    (projectId ? `${projectId}.appspot.com` : undefined);
+    normalizeBucketName(process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET) ||
+    (projectId ? `${projectId}.firebasestorage.app` : undefined);
 
   if (projectId && clientEmail && privateKey) {
     return initializeApp({

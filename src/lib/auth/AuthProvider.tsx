@@ -15,13 +15,13 @@ import {
   setDoc,
   updateDoc,
 } from "firebase/firestore";
-import type { User } from "firebase/auth";
+import type { User as FbUser } from "firebase/auth";
 import { auth, db } from "@/lib/firebase/client";
 import type { AppRole } from "@/lib/auth/roles";
 import { normalizeRole } from "@/lib/auth/roles";
 
 type AuthCtx = {
-  user: User | null;
+  user: FbUser | null;
   role: AppRole;
   loading: boolean;
   logout: () => Promise<void>;
@@ -37,12 +37,58 @@ function getErrMsg(e: unknown): string {
   return "Falha";
 }
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function readString(
+  obj: Record<string, unknown>,
+  key: string
+): string | undefined {
+  const v = obj[key];
+  return typeof v === "string" ? v : undefined;
+}
+
+async function callWalletBootstrap(u: FbUser): Promise<void> {
+  try {
+    const token = await u.getIdToken(true);
+    const res = await fetch("/api/wallet/bootstrap", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    // Consome body para evitar pendência e ajudar debug (sem quebrar fluxo)
+    const ct = res.headers.get("content-type") ?? "";
+    const text = await res.text();
+
+    if (!res.ok) {
+      let msg = `wallet/bootstrap falhou (${res.status})`;
+      if (ct.includes("application/json")) {
+        try {
+          const parsed: unknown = JSON.parse(text);
+          if (isRecord(parsed)) {
+            const e = readString(parsed, "error");
+            if (e) msg = e;
+          }
+        } catch {
+          // ignora
+        }
+      }
+      console.warn(msg, text.slice(0, 200));
+    }
+  } catch (e: unknown) {
+    console.warn("wallet/bootstrap erro:", getErrMsg(e));
+  }
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<FbUser | null>(null);
   const [role, setRole] = useState<AppRole>("user");
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    let cancelled = false;
+
     const unsub = onAuthStateChanged(auth, async (u) => {
       setLoading(true);
       setUser(u);
@@ -55,9 +101,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         const ref = doc(db, "users", u.uid);
         const snap = await getDoc(ref);
+        if (cancelled) return;
 
         if (!snap.exists()) {
-          // cria doc padrão, sem quebrar seu admin manual depois
+          // Cria doc mínimo de perfil (SEM saldo; saldo é somente servidor)
           await setDoc(
             ref,
             {
@@ -66,37 +113,55 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               displayName: u.displayName ?? "",
               photoURL: u.photoURL ?? "",
               role: "user",
-              walletBalance: 0,
               createdAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
             },
             { merge: true }
           );
+          if (cancelled) return;
+
           setRole("user");
         } else {
-          const data = snap.data() as { role?: unknown };
-          const r = normalizeRole(data.role);
+          const dataRaw: unknown = snap.data();
+          const data = isRecord(dataRaw) ? dataRaw : {};
 
-          // atualiza somente campos "não-críticos" (não toca no role)
-          await updateDoc(ref, {
-            email: u.email ?? "",
-            displayName: u.displayName ?? "",
-            photoURL: u.photoURL ?? "",
-            updatedAt: serverTimestamp(),
-          });
-
+          const r = normalizeRole(readString(data, "role"));
           setRole(r);
+
+          // Atualiza apenas campos não-críticos (não toca no role, não toca em saldo)
+          const patch: Record<string, unknown> = {};
+          const nextEmail = u.email ?? "";
+          const nextName = u.displayName ?? "";
+          const nextPhoto = u.photoURL ?? "";
+
+          const curEmail = readString(data, "email") ?? "";
+          const curName = readString(data, "displayName") ?? "";
+          const curPhoto = readString(data, "photoURL") ?? "";
+
+          if (curEmail !== nextEmail) patch.email = nextEmail;
+          if (curName !== nextName) patch.displayName = nextName;
+          if (curPhoto !== nextPhoto) patch.photoURL = nextPhoto;
+
+          if (Object.keys(patch).length > 0) {
+            patch.updatedAt = serverTimestamp();
+            await updateDoc(ref, patch);
+          }
         }
+
+        // Dispara bootstrap (piso 50 + regra de 1h) sem bloquear a UI
+        void callWalletBootstrap(u);
       } catch (e: unknown) {
-        // Se falhar a leitura, não assume admin.
         console.error("AuthProvider role load error:", getErrMsg(e));
         setRole("user");
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     });
 
-    return () => unsub();
+    return () => {
+      cancelled = true;
+      unsub();
+    };
   }, []);
 
   const value = useMemo<AuthCtx>(
