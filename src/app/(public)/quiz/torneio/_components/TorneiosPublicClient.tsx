@@ -110,9 +110,17 @@ export default function TorneiosPublicClient() {
       });
 
       const json = await readJsonOrThrow(res);
-      const raw = json.items as unknown;
 
-      if (!Array.isArray(raw)) throw new Error("RESPOSTA_INVALIDA");
+      // compat: backend pode devolver "items" ou "tournaments"
+      const rawArr = (json.items ??
+        (json as Record<string, unknown>).tournaments) as unknown;
+
+      if (!Array.isArray(rawArr)) {
+        const keys = Object.keys(json);
+        throw new Error(`RESPOSTA_INVALIDA (keys=${keys.join(",")})`);
+      }
+
+      const raw = rawArr;
 
       const parsed: Item[] = [];
       for (const it of raw) {

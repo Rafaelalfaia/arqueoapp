@@ -5,6 +5,9 @@ import type { Transaction } from "firebase-admin/firestore";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { COL, DEFAULTS, type PrizeSplit, type TournamentType } from "./config";
 
+const MIN_WALLET = 50;
+const TOPUP_INTERVAL_MS = 60 * 60 * 1000; // 1h
+
 /** Helpers de parsing (sem any, sem null) */
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -302,15 +305,7 @@ function readTimestampMs(
   key: string
 ): number | undefined {
   const v = obj[key];
-  // Timestamp do firebase-admin geralmente tem toMillis()
-  if (v && typeof v === "object" && "toMillis" in v) {
-    const tm = (v as { toMillis?: unknown }).toMillis;
-    if (typeof tm === "function") {
-      const ms = (v as { toMillis: () => number }).toMillis();
-      return Number.isFinite(ms) ? ms : undefined;
-    }
-  }
-  return undefined;
+  return v instanceof Timestamp ? v.toMillis() : undefined;
 }
 
 type AnyDocSnap =
@@ -336,19 +331,16 @@ export async function applyDiamondsDeltaTx(
   uid: string,
   delta: number,
   reason: string,
-  meta: Record<string, unknown>,
-  opts?: ApplyDiamondsOpts
+  meta: Record<string, unknown>
 ): Promise<void> {
   const userRef = adminDb.collection(COL.users).doc(uid);
 
-  const snap: AnyDocSnap = opts?.userSnap ?? (await tx.get(userRef));
+  // IMPORTANTE: este helper faz leitura. Garanta que a transação não tenha feito writes antes.
+  const userSnap = await tx.get(userRef);
 
-  const now = typeof opts?.nowMs === "number" ? opts!.nowMs : Date.now();
-  const ensureFloor = opts?.ensureFloor !== false;
-
-  const curBalance = snap.exists
+  const curBalance = userSnap.exists
     ? (() => {
-        const u = asRecord(snap.data() as unknown, "USER_INVALIDO");
+        const u = asRecord(userSnap.data() as unknown, "USER_INVALIDO");
         const wb = readNumber(u, "walletBalance");
         const d = readNumber(u, "diamonds");
         const cur = isNumber(wb) ? wb : isNumber(d) ? d : 0;
@@ -356,69 +348,65 @@ export async function applyDiamondsDeltaTx(
       })()
     : 0;
 
-  let effectiveCur = curBalance;
+  // Piso: se saldo < 50 e já passou 1h desde o último topup, completa.
+  // (Se user não existe ainda, também inicia com 50.)
+  const now = Date.now();
+  let base = curBalance;
+
+  let appliedTopup = false;
   let topupDelta = 0;
 
-  // piso 50 por hora (server-authoritative)
-  if (ensureFloor && effectiveCur < WALLET_MIN) {
-    const u = snap.exists
-      ? asRecord(snap.data() as unknown, "USER_INVALIDO")
-      : undefined;
-
-    const lastTopupMs = u ? readTimestampMs(u, "walletTopupAt") : undefined;
-
+  if (!userSnap.exists) {
+    appliedTopup = true;
+    topupDelta = MIN_WALLET - base; // base é 0
+    base = MIN_WALLET;
+  } else {
+    const u = asRecord(userSnap.data() as unknown, "USER_INVALIDO");
+    const lastTopupMs = readTimestampMs(u, "walletTopupAt");
     const canTopup =
-      typeof lastTopupMs !== "number" ||
-      now - lastTopupMs >= WALLET_TOPUP_INTERVAL_MS;
+      typeof lastTopupMs !== "number" || now - lastTopupMs >= TOPUP_INTERVAL_MS;
 
-    if (canTopup) {
-      topupDelta = WALLET_MIN - effectiveCur; // > 0
-      effectiveCur = WALLET_MIN;
+    if (base < MIN_WALLET && canTopup) {
+      appliedTopup = true;
+      topupDelta = MIN_WALLET - base;
+      base = MIN_WALLET;
     }
   }
 
-  const next = effectiveCur + delta;
+  const next = base + delta;
   if (next < 0) throw new Error("SALDO_INSUFICIENTE");
 
-  // monta payload sem undefined
-  const userPayload: Record<string, unknown> = {
+  // Atualização consolidada (saldo final)
+  const payload: Record<string, unknown> = {
     walletBalance: next,
     diamonds: next, // compatibilidade MVP
     updatedAt: FieldValue.serverTimestamp(),
   };
 
-  if (topupDelta > 0) {
-    userPayload.walletTopupAt = FieldValue.serverTimestamp();
+  if (appliedTopup) {
+    payload.walletTopupAt = FieldValue.serverTimestamp();
+    if (!userSnap.exists) payload.createdAt = FieldValue.serverTimestamp();
   }
 
-  if (!snap.exists) {
-    tx.set(
-      userRef,
-      { uid, ...userPayload, createdAt: FieldValue.serverTimestamp() },
-      { merge: true }
-    );
+  if (!userSnap.exists) {
+    tx.set(userRef, payload, { merge: true });
   } else {
-    tx.update(userRef, userPayload);
+    tx.update(userRef, payload);
   }
 
-  // ledger do topup (se ocorreu)
-  if (topupDelta > 0) {
-    const topupRef = adminDb.collection(COL.ledger).doc();
-    tx.set(topupRef, {
+  // Ledger do topup (se aplicou)
+  if (appliedTopup && topupDelta > 0) {
+    const ledgerTopupRef = adminDb.collection(COL.ledger).doc();
+    tx.set(ledgerTopupRef, {
       uid,
       delta: topupDelta,
       reason: "WALLET_FLOOR_TOPUP",
-      meta: {
-        min: WALLET_MIN,
-        intervalMs: WALLET_TOPUP_INTERVAL_MS,
-        via: "applyDiamondsDeltaTx",
-        triggeredBy: reason,
-      },
+      meta: { min: MIN_WALLET, via: "applyDiamondsDeltaTx" },
       createdAt: FieldValue.serverTimestamp(),
     });
   }
 
-  // ledger do delta principal
+  // Ledger da transação principal
   const ledgerRef = adminDb.collection(COL.ledger).doc();
   tx.set(ledgerRef, {
     uid,
