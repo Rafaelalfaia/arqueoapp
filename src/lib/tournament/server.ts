@@ -5,10 +5,11 @@ import type { Transaction } from "firebase-admin/firestore";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { COL, DEFAULTS, type PrizeSplit, type TournamentType } from "./config";
 
-const MIN_WALLET = 50;
-const TOPUP_INTERVAL_MS = 60 * 60 * 1000; // 1h
-
-/** Helpers de parsing (sem any, sem null) */
+/**
+ * ============================================================
+ * Helpers de parsing (sem any, sem null)
+ * ============================================================
+ */
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -75,13 +76,54 @@ function normalizeRoles(arr: string[] | undefined): string[] {
   return arr.map((x) => x.trim().toLowerCase()).filter((x) => x.length > 0);
 }
 
-/** Auth */
+/**
+ * Converte Timestamp/objetos Timestamp-like para ms (robusto p/ Admin SDK)
+ */
+export function toMs(v: unknown): number | undefined {
+  if (!v) return undefined;
+
+  if (v instanceof Timestamp) return v.toMillis();
+
+  if (typeof v === "object") {
+    const o = v as {
+      toMillis?: unknown;
+      seconds?: unknown;
+      _seconds?: unknown;
+    };
+
+    if (typeof o.toMillis === "function") {
+      try {
+        const x = (o.toMillis as () => number)();
+        return Number.isFinite(x) ? x : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+
+    const s =
+      typeof o.seconds === "number"
+        ? o.seconds
+        : typeof o._seconds === "number"
+        ? o._seconds
+        : undefined;
+
+    if (typeof s === "number" && Number.isFinite(s)) return s * 1000;
+  }
+
+  return undefined;
+}
+
+/**
+ * ============================================================
+ * Auth
+ * ============================================================
+ */
 export type AuthedUser = {
   uid: string;
-  role?: string; // claim role (raw)
-  roles?: string[]; // claim roles (raw)
-  admin?: boolean; // claim admin (raw)
-  isAdmin?: boolean; // computed
+  role?: string;
+  roles?: string[];
+  admin?: boolean;
+  isAdmin?: boolean;
 };
 
 function getBearer(req: Request): string | undefined {
@@ -94,68 +136,51 @@ function getBearer(req: Request): string | undefined {
   return m?.[1];
 }
 
-/**
- * DEV fallback:
- * - Em produção: só usa se ALLOW_FIRESTORE_ROLE_FALLBACK === "true"
- * - Em desenvolvimento: habilita por padrão, a menos que ALLOW_FIRESTORE_ROLE_FALLBACK === "false"
- */
 function firestoreFallbackEnabled(): boolean {
   const env = process.env.ALLOW_FIRESTORE_ROLE_FALLBACK;
   if (process.env.NODE_ENV === "production") return env === "true";
-  // dev/test: default ON, allow opt-out
-  return env !== "false";
+  return env !== "false"; // dev/test: default ON
 }
 
-async function getFirestoreRoleIfAllowed(
-  uid: string
-): Promise<"admin" | undefined> {
-  if (!firestoreFallbackEnabled()) return undefined;
+async function getFirestoreAdminIfAllowed(uid: string): Promise<boolean> {
+  if (!firestoreFallbackEnabled()) return false;
 
   const snap = await adminDb.collection(COL.users).doc(uid).get();
-  if (!snap.exists) return undefined;
+  if (!snap.exists) return false;
 
   const data = snap.data();
-  if (!data) return undefined;
+  if (!data) return false;
 
   const u = asRecord(data as unknown, "USER_INVALIDO");
-
   const role = normalizeRole(readString(u, "role"));
   const rolesArr = normalizeRoles(readStringArray(u, "roles"));
-
-  if (role === "admin") return "admin";
-  if (rolesArr.includes("admin")) return "admin";
-  return undefined;
+  return role === "admin" || rolesArr.includes("admin");
 }
 
 export async function requireUser(req: Request): Promise<AuthedUser> {
   const token = getBearer(req);
   if (!token) throw new Error("UNAUTHENTICATED");
 
-  // true => verifica revogação (mais seguro)
   const decoded: DecodedIdToken = await adminAuth.verifyIdToken(token, true);
   const raw = asRecord(decoded as unknown, "UNAUTHENTICATED");
 
-  // claims possíveis
   const rolesRaw = readStringArray(raw, "roles");
   const roleRaw = readString(raw, "role");
   const adminFlag = readBoolean(raw, "admin");
   const isAdminFlag = readBoolean(raw, "isAdmin");
 
-  // normalização (case-insensitive)
   const roleNorm = normalizeRole(roleRaw);
   const rolesNorm = normalizeRoles(rolesRaw);
 
-  // computed admin por claims
   let computedIsAdmin =
     adminFlag === true ||
     isAdminFlag === true ||
     roleNorm === "admin" ||
     rolesNorm.includes("admin");
 
-  // fallback (DEV / opcional)
   if (!computedIsAdmin) {
-    const dbRole = await getFirestoreRoleIfAllowed(decoded.uid);
-    if (dbRole === "admin") computedIsAdmin = true;
+    const dbAdmin = await getFirestoreAdminIfAllowed(decoded.uid);
+    if (dbAdmin) computedIsAdmin = true;
   }
 
   return {
@@ -185,7 +210,11 @@ export async function requireAdmin(req: Request): Promise<AuthedUser> {
   return user;
 }
 
-/** Time */
+/**
+ * ============================================================
+ * Time
+ * ============================================================
+ */
 export function nowMs(): number {
   return Date.now();
 }
@@ -200,7 +229,11 @@ export function addMinutes(ts: Timestamp, minutes: number): Timestamp {
   return Timestamp.fromMillis(ts.toMillis() + minutes * 60_000);
 }
 
-/** Validadores */
+/**
+ * ============================================================
+ * Validadores
+ * ============================================================
+ */
 export function assertTournamentType(raw: unknown): TournamentType {
   if (raw === "recurring" || raw === "special") return raw;
   throw new Error("TORNEIO_INVALIDO");
@@ -225,8 +258,9 @@ export function normalizePrizeSplit(raw: unknown): PrizeSplit {
 }
 
 /**
- * Questões (MVP)
- * Ajuste os campos conforme seu schema real.
+ * ============================================================
+ * Questões (CANÔNICO + fallback legado)
+ * ============================================================
  */
 export type QuestionPack = {
   questionIds: string[];
@@ -234,14 +268,48 @@ export type QuestionPack = {
   points: number[];
 };
 
+type Difficulty = "easy" | "medium" | "hard";
+
+function asDifficulty(v: unknown): Difficulty {
+  return v === "hard" ? "hard" : v === "medium" ? "medium" : "easy";
+}
+
+function pointsForDifficulty(d: Difficulty): number {
+  if (d === "hard") return 30;
+  if (d === "medium") return 20;
+  return 10;
+}
+
+function readStringArray4(
+  obj: Record<string, unknown>,
+  key: string
+): string[] | undefined {
+  const v = obj[key];
+  if (!Array.isArray(v) || v.length !== 4) return undefined;
+  for (const it of v) if (!isString(it)) return undefined;
+  return v;
+}
+
+async function loadActiveQuestionsSnapshot() {
+  let snap = await adminDb
+    .collection(COL.questions)
+    .where("active", "==", true)
+    .limit(1000)
+    .get();
+  if (snap.size === 0) {
+    snap = await adminDb
+      .collection(COL.questions)
+      .where("isActive", "==", true)
+      .limit(1000)
+      .get();
+  }
+  return snap;
+}
+
 export async function pickQuestionPack(
   questionCount: number
 ): Promise<QuestionPack> {
-  const snap = await adminDb
-    .collection(COL.questions)
-    .where("isActive", "==", true)
-    .limit(1000)
-    .get();
+  const snap = await loadActiveQuestionsSnapshot();
 
   if (snap.size < questionCount) {
     throw new Error(
@@ -264,67 +332,35 @@ export async function pickQuestionPack(
   for (const d of chosen) {
     const data = asRecord(d.data() as unknown, `Questão ${d.id} inválida`);
 
+    const text = (readString(data, "text") ?? "").trim();
+    const choices = readStringArray4(data, "choices");
     const ci = readNumber(data, "correctIndex");
-    if (!isNumber(ci))
-      throw new Error(`Questão ${d.id} sem correctIndex numérico`);
-
+    const diff = asDifficulty(data["difficulty"]);
     const pts = readNumber(data, "points");
+
+    if (!text) throw new Error(`Questão ${d.id} sem text`);
+    if (!choices) throw new Error(`Questão ${d.id} sem choices[4]`);
+    if (!isNumber(ci) || ci < 0 || ci > 3)
+      throw new Error(`Questão ${d.id} correctIndex inválido`);
 
     questionIds.push(d.id);
     correctIndexes.push(ci);
-    points.push(isNumber(pts) ? pts : 100);
+    points.push(isNumber(pts) ? pts : pointsForDifficulty(diff));
   }
 
   return { questionIds, correctIndexes, points };
 }
 
 /**
- * Sanitiza questão para o cliente (remove gabarito / pontos).
+ * ============================================================
+ * Economia (helpers)
+ * ============================================================
  */
-export type ClientQuestion = Record<string, unknown> & { id: string };
-
-export function sanitizeQuestion(id: string, data: unknown): ClientQuestion {
-  const obj = asRecord(data, `Questão ${id} sem dados`);
-  const {
-    correctIndex: _a,
-    correctIndexes: _b,
-    answer: _c,
-    points: _d,
-    ...rest
-  } = obj;
-
-  return { id, ...rest };
+export function readWalletBalance(u: Record<string, unknown>): number {
+  const wb = readNumber(u, "walletBalance");
+  const d = readNumber(u, "diamonds");
+  return isNumber(wb) ? wb : isNumber(d) ? d : 0;
 }
-
-// === Wallet floor (MVP) ===
-const WALLET_MIN = 50;
-const WALLET_TOPUP_INTERVAL_MS = 60 * 60 * 1000; // 1h
-
-function readTimestampMs(
-  obj: Record<string, unknown>,
-  key: string
-): number | undefined {
-  const v = obj[key];
-  return v instanceof Timestamp ? v.toMillis() : undefined;
-}
-
-type AnyDocSnap =
-  FirebaseFirestore.DocumentSnapshot<FirebaseFirestore.DocumentData>;
-
-export type ApplyDiamondsOpts = {
-  /**
-   * IMPORTANTE:
-   * Passe o snapshot lido ANTES de qualquer write na transação
-   * para evitar: "all reads before all writes".
-   */
-  userSnap?: AnyDocSnap;
-  nowMs?: number;
-  /**
-   * Default: true (aplica piso 50 se elegível).
-   * Você pode desligar em flows específicos, se quiser.
-   */
-  ensureFloor?: boolean;
-};
 
 export async function applyDiamondsDeltaTx(
   tx: Transaction,
@@ -334,81 +370,37 @@ export async function applyDiamondsDeltaTx(
   meta: Record<string, unknown>
 ): Promise<void> {
   const userRef = adminDb.collection(COL.users).doc(uid);
-
-  // IMPORTANTE: este helper faz leitura. Garanta que a transação não tenha feito writes antes.
   const userSnap = await tx.get(userRef);
 
   const curBalance = userSnap.exists
-    ? (() => {
-        const u = asRecord(userSnap.data() as unknown, "USER_INVALIDO");
-        const wb = readNumber(u, "walletBalance");
-        const d = readNumber(u, "diamonds");
-        const cur = isNumber(wb) ? wb : isNumber(d) ? d : 0;
-        return cur;
-      })()
+    ? readWalletBalance(asRecord(userSnap.data() as unknown, "USER_INVALIDO"))
     : 0;
 
-  // Piso: se saldo < 50 e já passou 1h desde o último topup, completa.
-  // (Se user não existe ainda, também inicia com 50.)
-  const now = Date.now();
-  let base = curBalance;
-
-  let appliedTopup = false;
-  let topupDelta = 0;
-
-  if (!userSnap.exists) {
-    appliedTopup = true;
-    topupDelta = MIN_WALLET - base; // base é 0
-    base = MIN_WALLET;
-  } else {
-    const u = asRecord(userSnap.data() as unknown, "USER_INVALIDO");
-    const lastTopupMs = readTimestampMs(u, "walletTopupAt");
-    const canTopup =
-      typeof lastTopupMs !== "number" || now - lastTopupMs >= TOPUP_INTERVAL_MS;
-
-    if (base < MIN_WALLET && canTopup) {
-      appliedTopup = true;
-      topupDelta = MIN_WALLET - base;
-      base = MIN_WALLET;
-    }
-  }
-
-  const next = base + delta;
+  const next = curBalance + delta;
   if (next < 0) throw new Error("SALDO_INSUFICIENTE");
 
-  // Atualização consolidada (saldo final)
-  const payload: Record<string, unknown> = {
+  const payload = {
     walletBalance: next,
-    diamonds: next, // compatibilidade MVP
+    diamonds: next,
     updatedAt: FieldValue.serverTimestamp(),
   };
 
-  if (appliedTopup) {
-    payload.walletTopupAt = FieldValue.serverTimestamp();
-    if (!userSnap.exists) payload.createdAt = FieldValue.serverTimestamp();
-  }
-
   if (!userSnap.exists) {
-    tx.set(userRef, payload, { merge: true });
+    tx.set(
+      userRef,
+      {
+        uid,
+        role: "user",
+        ...payload,
+        createdAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
   } else {
     tx.update(userRef, payload);
   }
 
-  // Ledger do topup (se aplicou)
-  if (appliedTopup && topupDelta > 0) {
-    const ledgerTopupRef = adminDb.collection(COL.ledger).doc();
-    tx.set(ledgerTopupRef, {
-      uid,
-      delta: topupDelta,
-      reason: "WALLET_FLOOR_TOPUP",
-      meta: { min: MIN_WALLET, via: "applyDiamondsDeltaTx" },
-      createdAt: FieldValue.serverTimestamp(),
-    });
-  }
-
-  // Ledger da transação principal
-  const ledgerRef = adminDb.collection(COL.ledger).doc();
-  tx.set(ledgerRef, {
+  tx.set(adminDb.collection(COL.ledger).doc(), {
     uid,
     delta,
     reason,

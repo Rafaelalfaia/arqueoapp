@@ -1,8 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useAuth } from "@/lib/auth/AuthProvider";
 import { useRouter } from "next/navigation";
+import { useAuth } from "@/lib/auth/AuthProvider";
 
 type TournamentType = "recurring" | "special";
 type TournamentStatus = "open" | "scheduled" | "live" | "closed" | "draft";
@@ -22,18 +22,15 @@ type Item = {
   serverNowMs?: number;
 };
 
-const FALLBACK_COVER = "/covers/tournaments/fallback.jpg"; // garanta existir em /public
+const FALLBACK_COVER = "/covers/tournaments/fallback.jpg";
+
+// CANÔNICOS (sem alias)
+const API_LIST = "/api/quiz/tournament/public/list";
+const API_ENROLL = "/api/quiz/tournament/public/enroll";
+const API_JOIN = "/api/quiz/tournament/public/join";
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-function readString(
-  obj: Record<string, unknown>,
-  key: string
-): string | undefined {
-  const v = obj[key];
-  return typeof v === "string" ? v : undefined;
 }
 
 function safeJsonParse(text: string): unknown {
@@ -42,6 +39,14 @@ function safeJsonParse(text: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+function readString(
+  obj: Record<string, unknown>,
+  key: string
+): string | undefined {
+  const v = obj[key];
+  return typeof v === "string" ? v : undefined;
 }
 
 async function readJsonOrThrow(
@@ -65,12 +70,10 @@ async function readJsonOrThrow(
     );
   }
 
-  if (!res.ok) {
+  if (!res.ok)
     throw new Error(
       readString(parsed, "error") ?? `Falha HTTP (${res.status})`
     );
-  }
-
   return parsed;
 }
 
@@ -81,12 +84,11 @@ function formatDate(ms?: number | null): string {
 
 export default function TorneiosPublicClient() {
   const { user } = useAuth();
+  const router = useRouter();
 
   const [items, setItems] = useState<Item[]>([]);
   const [loadingList, setLoadingList] = useState(false);
   const [error, setError] = useState("");
-
-  const router = useRouter();
 
   const [q, setQ] = useState("");
   const [tab, setTab] = useState<"all" | "recurring" | "special">("all");
@@ -98,59 +100,54 @@ export default function TorneiosPublicClient() {
 
   const loadList = useCallback(async (): Promise<void> => {
     if (!user) return;
-    setError("");
+
     setLoadingList(true);
+    setError("");
 
     try {
       const token = await getToken();
 
-      const res = await fetch("/api/tournament/public/list", {
+      const res = await fetch(API_LIST, {
         method: "GET",
         headers: { Authorization: `Bearer ${token}` },
       });
 
       const json = await readJsonOrThrow(res);
 
-      // compat: backend pode devolver "items" ou "tournaments"
-      const rawArr = (json.items ??
-        (json as Record<string, unknown>).tournaments) as unknown;
-
-      if (!Array.isArray(rawArr)) {
-        const keys = Object.keys(json);
-        throw new Error(`RESPOSTA_INVALIDA (keys=${keys.join(",")})`);
-      }
-
-      const raw = rawArr;
+      // DEFINITIVO: aceita items OU tournaments (compat)
+      const raw = (json.items ??
+        json.tournaments ??
+        json.data ??
+        []) as unknown;
+      if (!Array.isArray(raw)) throw new Error("RESPOSTA_INVALIDA");
 
       const parsed: Item[] = [];
       for (const it of raw) {
         if (!isRecord(it)) continue;
 
+        const id = typeof it.id === "string" ? it.id : "";
+        const title = typeof it.title === "string" ? it.title : "";
+        const type = (
+          it.type === "special" ? "special" : "recurring"
+        ) as TournamentType;
+        const status = (
+          typeof it.status === "string" ? it.status : "open"
+        ) as TournamentStatus;
+
         parsed.push({
-          id: String(it.id ?? ""),
-          title: String(it.title ?? ""),
-          type: (it.type === "special"
-            ? "special"
-            : "recurring") as TournamentType,
-          status: (typeof it.status === "string"
-            ? it.status
-            : "open") as TournamentStatus,
+          id,
+          title,
+          type,
+          status,
           questionCount:
             typeof it.questionCount === "number" ? it.questionCount : undefined,
           maxParticipants:
-            typeof it.maxParticipants === "number"
-              ? it.maxParticipants
-              : ((it.maxParticipants ?? null) as null),
-          startAtMs:
-            typeof it.startAtMs === "number"
-              ? it.startAtMs
-              : ((it.startAtMs ?? null) as null),
+            typeof it.maxParticipants === "number" ? it.maxParticipants : null,
+          startAtMs: typeof it.startAtMs === "number" ? it.startAtMs : null,
           graceMinutes:
             typeof it.graceMinutes === "number" ? it.graceMinutes : 10,
           joinClosesAtMs:
-            typeof it.joinClosesAtMs === "number"
-              ? it.joinClosesAtMs
-              : ((it.joinClosesAtMs ?? null) as null),
+            typeof it.joinClosesAtMs === "number" ? it.joinClosesAtMs : null,
           coverUrl: typeof it.coverUrl === "string" ? it.coverUrl : "",
           enrolled: it.enrolled === true,
           serverNowMs:
@@ -165,34 +162,6 @@ export default function TorneiosPublicClient() {
       setLoadingList(false);
     }
   }, [user, getToken]);
-
-  const joinAndGo = useCallback(
-    async (tournamentId: string) => {
-      if (!user) return;
-      setError("");
-
-      try {
-        const token = await getToken();
-        const res = await fetch("/api/tournament/public/join", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({ tournamentId }),
-        });
-
-        const json = await readJsonOrThrow(res);
-        const redirectTo =
-          typeof json.redirectTo === "string" ? json.redirectTo : "";
-        if (!redirectTo) throw new Error("RESPOSTA_INVALIDA");
-        router.push(redirectTo);
-      } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : "Erro");
-      }
-    },
-    [user, getToken, router]
-  );
 
   useEffect(() => {
     if (!user) return;
@@ -217,7 +186,7 @@ export default function TorneiosPublicClient() {
 
       try {
         const token = await getToken();
-        const res = await fetch("/api/tournament/public/enroll", {
+        const res = await fetch(API_ENROLL, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${token}`,
@@ -235,9 +204,38 @@ export default function TorneiosPublicClient() {
     [user, getToken, loadList]
   );
 
+  const join = useCallback(
+    async (tournamentId: string) => {
+      if (!user) return;
+      setError("");
+
+      try {
+        const token = await getToken();
+        const res = await fetch(API_JOIN, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ tournamentId }),
+        });
+
+        const json = await readJsonOrThrow(res);
+
+        const instanceId =
+          typeof json.instanceId === "string" ? json.instanceId : "";
+        if (!instanceId) throw new Error("RESPOSTA_INVALIDA");
+
+        router.push(`/quiz/torneio/sala/${instanceId}`);
+      } catch (e: unknown) {
+        setError(e instanceof Error ? e.message : "Erro");
+      }
+    },
+    [user, getToken, router]
+  );
+
   return (
     <div className="grid gap-4">
-      {/* topo */}
       <div className="rounded-2xl border border-white/10 bg-black/40 p-4 flex items-center justify-between gap-3">
         <div>
           <div className="text-base font-semibold">Torneios disponíveis</div>
@@ -302,7 +300,6 @@ export default function TorneiosPublicClient() {
           {filtered.map((t) => {
             const img = t.coverUrl?.trim() ? t.coverUrl : FALLBACK_COVER;
 
-            // lógica de botão para special
             const now =
               typeof t.serverNowMs === "number" ? t.serverNowMs : Date.now();
             const start = typeof t.startAtMs === "number" ? t.startAtMs : null;
@@ -328,9 +325,16 @@ export default function TorneiosPublicClient() {
                 className="overflow-hidden rounded-xl border border-white/10 bg-black/50"
               >
                 <div className="relative">
-                  <div
-                    className="h-28 w-full bg-cover bg-center"
-                    style={{ backgroundImage: `url(${img})` }}
+                  {/* definitivo: img real com fallback */}
+                  <img
+                    src={img}
+                    alt=""
+                    className="h-28 w-full object-cover"
+                    onError={(e) => {
+                      const el = e.currentTarget;
+                      if (el.src !== location.origin + FALLBACK_COVER)
+                        el.src = FALLBACK_COVER;
+                    }}
                   />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/10 to-transparent" />
                   <div className="absolute right-3 top-3 flex gap-2">
@@ -388,7 +392,7 @@ export default function TorneiosPublicClient() {
                     {canEnterSpecial ? (
                       <button
                         className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-sm"
-                        onClick={() => void joinAndGo(t.id)}
+                        onClick={() => void join(t.id)}
                       >
                         Começar
                       </button>
@@ -397,7 +401,7 @@ export default function TorneiosPublicClient() {
                     {t.type === "recurring" ? (
                       <button
                         className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-sm"
-                        onClick={() => void joinAndGo(t.id)}
+                        onClick={() => void join(t.id)}
                       >
                         Entrar
                       </button>

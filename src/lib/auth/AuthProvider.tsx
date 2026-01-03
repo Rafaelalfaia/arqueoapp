@@ -37,20 +37,15 @@ function getErrMsg(e: unknown): string {
   return "Falha";
 }
 
-async function bootstrapWallet(u: User, signal?: AbortSignal): Promise<void> {
-  // Não quebra login se falhar; é “best effort”.
-  const token = await u.getIdToken(true);
-
-  const res = await fetch("/api/wallet/bootstrap", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    signal,
-  });
-
-  // Se não vier JSON/OK, apenas loga (não derruba a sessão)
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    console.warn("wallet/bootstrap failed:", res.status, text.slice(0, 200));
+async function callWalletBootstrap(u: User): Promise<void> {
+  try {
+    const token = await u.getIdToken(true);
+    await fetch("/api/wallet/bootstrap", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch {
+    // silencioso: não pode travar login
   }
 }
 
@@ -60,7 +55,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const ac = new AbortController();
+    let intervalId: number | null = null;
 
     const unsub = onAuthStateChanged(auth, async (u) => {
       setLoading(true);
@@ -76,7 +71,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const snap = await getDoc(ref);
 
         if (!snap.exists()) {
-          // cria doc “perfil/espelho”, sem campos sensíveis (saldo)
+          // cria doc padrão (pode manter wallet vazio; bootstrap do servidor garante o piso)
           await setDoc(
             ref,
             {
@@ -93,23 +88,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setRole("user");
         } else {
           const data = snap.data() as { role?: unknown };
-          const r = normalizeRole(data.role);
-
-          // atualiza somente campos não-críticos
-          await updateDoc(ref, {
-            email: u.email ?? "",
-            displayName: u.displayName ?? "",
-            photoURL: u.photoURL ?? "",
-            updatedAt: serverTimestamp(),
-          });
-
-          setRole(r);
+          setRole(normalizeRole(data.role));
         }
 
-        // Garante piso de saldo no servidor (50 + regra 1h)
-        await bootstrapWallet(u, ac.signal);
+        // Atualiza SOMENTE campos permitidos pelas rules (evita permission-denied)
+        // (não toca email/role/wallet por client)
+        await updateDoc(doc(db, "users", u.uid), {
+          displayName: u.displayName ?? "",
+          photoURL: u.photoURL ?? "",
+          updatedAt: serverTimestamp(),
+        });
+
+        // wallet bootstrap imediato + a cada 1h
+        await callWalletBootstrap(u);
+
+        if (intervalId) window.clearInterval(intervalId);
+        intervalId = window.setInterval(
+          () => void callWalletBootstrap(u),
+          60 * 60 * 1000
+        );
       } catch (e: unknown) {
-        console.error("AuthProvider error:", getErrMsg(e));
+        console.error("AuthProvider role load error:", getErrMsg(e));
         setRole("user");
       } finally {
         setLoading(false);
@@ -117,7 +116,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
 
     return () => {
-      ac.abort();
+      if (intervalId) window.clearInterval(intervalId);
       unsub();
     };
   }, []);

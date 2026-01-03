@@ -166,7 +166,7 @@ export async function GET(req: Request) {
       await Promise.allSettled(enrollmentChecks);
     }
 
-    return NextResponse.json({ ok: true, items });
+    return NextResponse.json({ ok: true, items, tournaments: items });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Erro";
     const status = msg === "UNAUTHENTICATED" ? 401 : 500;

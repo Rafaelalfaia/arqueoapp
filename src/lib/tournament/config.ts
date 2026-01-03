@@ -1,10 +1,10 @@
+// src/lib/tournament/config.ts
+
 export const COL = {
   tournaments: "quiz_tournaments",
   instances: "quiz_tournament_instances",
   privates: "quiz_tournament_private",
-
   questions: "quiz_questions",
-
   users: "users",
   ledger: "diamond_ledger",
 } as const;
@@ -26,22 +26,23 @@ export type PrizeSplit = {
 
 export type TournamentDefaults = {
   graceMinutes: number;
-  recurringJoinMinutes: number;
+
+  // recurring
+  recurringJoinMinutes: number; // se quiser expor no UI
+  recurringAutoStartSeconds: number; // regra pedida: 30s
+  recurringMinPlayersToStart: number; // regra pedida: 2
+
   maxPlayMinutes: number;
   prizeSplit: PrizeSplit;
 };
 
-/**
- * IMPORTANTE: não usar `as const` aqui para evitar readonly/compatibilidade
- * que costuma gerar ~~~~ em alguns setups.
- */
-export const DEFAULTS = {
+export const DEFAULTS: TournamentDefaults = {
   graceMinutes: 10,
+
   recurringJoinMinutes: 5,
+  recurringAutoStartSeconds: 30,
+  recurringMinPlayersToStart: 2,
+
   maxPlayMinutes: 20,
-
-  // Regra fixa:
   prizeSplit: { first: 0.5, second: 0.3, third: 0.2 },
-
-  // ...o resto que você já tem
-} as const;
+};
